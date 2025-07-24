@@ -239,7 +239,7 @@ function createPeerConnection(userId, isInitiator = false) {
             remoteVideo.style.background = 'transparent';
             
             // Essential video properties for proper playback
-            remoteVideo.muted = true; // Prevent audio feedback
+            remoteVideo.muted = false; // Allow remote audio to be heard
             remoteVideo.autoplay = true;
             remoteVideo.playsInline = true;
             remoteVideo.controls = false;
@@ -480,7 +480,7 @@ function addParticipant(participantId, participantName, isLocal = false) {
     
     const video = document.createElement('video');
     video.autoplay = true;
-    video.muted = true; // All videos should be muted to prevent feedback and allow autoplay
+    video.muted = isLocal; // Only mute local video to prevent feedback, allow remote audio
     video.playsInline = true;
     video.controls = false;
     

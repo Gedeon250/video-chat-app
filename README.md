@@ -47,6 +47,16 @@ A real-time video conferencing application built with WebRTC, Socket.IO, Node.js
 - Better error handling and recovery mechanisms
 - Optimized offer/answer exchange process
 
+### 4. Audio/Voice Sharing Issue ✅
+**Problem**: Participants could not hear each other's voices during video calls.
+
+**Solution Implemented**:
+- Fixed video element muted property - only local video is muted to prevent feedback
+- Remote videos are unmuted to allow audio playback
+- Proper distinction between local (muted) and remote (unmuted) audio streams
+- Enhanced audio track handling for better voice transmission
+- Ensured audio tracks are properly transmitted through WebRTC peer connections
+
 ## 🔧 Installation & Setup
 
 ### Prerequisites
