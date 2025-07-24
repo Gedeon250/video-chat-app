@@ -23,12 +23,19 @@ const meetingTime = document.getElementById('meetingTime');
 const sharedContent = document.getElementById('sharedContent');
 const sharedScreen = document.getElementById('sharedScreen');
 
+// SOCKET.IO variables
+const socket = io();
+const roomId = 'video-meeting-room';
+let peerConnections = {};
+
+
 // Initialize the app
 async function initializeApp() {
     try {
         console.log('Initializing video chat app...');
         // Start preview video
         await startPreview();
+        initializeSocketConnection();     // Initialize socket connection after preview
     } catch (error) {
         console.error('Failed to initialize app:', error);
     }
@@ -52,6 +59,214 @@ async function startPreview() {
         placeholder.className = 'video-placeholder';
         placeholder.textContent = 'Camera not available';
         previewVideo.parentNode.appendChild(placeholder);
+    }
+}
+
+// Initialize Socket.IO connection
+function initializeSocketConnection() {
+    socket.on('user-connected', (userId, userName) => {
+        console.log(`User ${userName} connected`);
+        addParticipant(userId, userName, false);
+        // New user joined, we create the offer (we are the initiator)
+        createPeerConnection(userId, true);
+        updateParticipantCount();
+    });
+    
+    socket.on('existing-users', (users) => {
+        users.forEach(user => {
+            addParticipant(user.userId, user.userName, false);
+            // These are existing users, they will create offers to us
+            createPeerConnection(user.userId, false);
+        });
+        updateParticipantCount();
+    });
+    
+    socket.on('user-disconnected', (userId) => {
+        console.log(`User ${userId} disconnected`);
+        if (peerConnections[userId]) {
+            peerConnections[userId].close();
+            delete peerConnections[userId];
+        }
+        removeParticipant(userId);
+        updateParticipantCount();
+    });
+    
+    socket.on('offer', async (offer, fromUserId) => {
+        try {
+            console.log(`Received offer from ${fromUserId}`);
+            const pc = createPeerConnection(fromUserId, false);
+            
+            if (pc.signalingState !== 'stable') {
+                console.log(`Peer connection not in stable state: ${pc.signalingState}`);
+                return;
+            }
+            
+            await pc.setRemoteDescription(offer);
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            socket.emit('answer', answer, fromUserId);
+        } catch (error) {
+            console.error(`Error handling offer from ${fromUserId}:`, error);
+        }
+    });
+    
+    socket.on('answer', async (answer, fromUserId) => {
+        try {
+            console.log(`Received answer from ${fromUserId}`);
+            const pc = peerConnections[fromUserId];
+            if (pc && pc.signalingState === 'have-local-offer') {
+                await pc.setRemoteDescription(answer);
+            } else {
+                console.log(`Ignoring answer from ${fromUserId}, wrong state: ${pc ? pc.signalingState : 'no connection'}`);
+            }
+        } catch (error) {
+            console.error(`Error handling answer from ${fromUserId}:`, error);
+        }
+    });
+    
+    socket.on('ice-candidate', async (candidate, fromUserId) => {
+        try {
+            console.log(`Received ICE candidate from ${fromUserId}`);
+            const pc = peerConnections[fromUserId];
+            if (pc && pc.remoteDescription) {
+                await pc.addIceCandidate(candidate);
+            } else {
+                console.log(`Queuing ICE candidate from ${fromUserId} (remote description not ready)`);
+                // You could implement queuing here if needed
+            }
+        } catch (error) {
+            console.error(`Error handling ICE candidate from ${fromUserId}:`, error);
+        }
+    });
+    
+    socket.on('user-toggle-audio', (userId, isMuted) => {
+        updateRemoteUserStatus(userId, 'audio', isMuted);
+    });
+    
+    socket.on('user-toggle-video', (userId, isVideoOff) => {
+        updateRemoteUserStatus(userId, 'video', isVideoOff);
+    });
+}
+
+// Create WebRTC peer connection
+function createPeerConnection(userId, isInitiator = false) {
+    if (peerConnections[userId]) {
+        return peerConnections[userId];
+    }
+    
+    const pc = new RTCPeerConnection({
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' },
+            { urls: 'stun:stun2.l.google.com:19302' }
+        ]
+    });
+    
+    // Add local stream to peer connection
+    if (localStream) {
+        localStream.getTracks().forEach(track => {
+            console.log(`Adding ${track.kind} track to peer connection for ${userId}`);
+            pc.addTrack(track, localStream);
+        });
+    }
+    
+    // Handle remote stream
+    pc.ontrack = (event) => {
+        console.log(`Received remote ${event.track.kind} track from ${userId}`);
+        const remoteVideo = document.querySelector(`#participant-${userId} video`);
+        if (remoteVideo && event.streams[0]) {
+            remoteVideo.srcObject = event.streams[0];
+            remoteVideo.style.display = 'block';
+            remoteVideo.style.opacity = '1';
+            
+            // Hide avatar when video starts
+            const participantElement = document.querySelector(`#participant-${userId}`);
+            if (participantElement) {
+                const avatar = participantElement.querySelector('div[style*="position: absolute"]');
+                if (avatar) {
+                    avatar.style.display = 'none';
+                }
+            }
+        }
+    };
+    
+    // Handle ICE candidates
+    pc.onicecandidate = (event) => {
+        if (event.candidate) {
+            console.log(`Sending ICE candidate to ${userId}`);
+            socket.emit('ice-candidate', event.candidate, userId);
+        }
+    };
+    
+    // Handle connection state changes
+    pc.onconnectionstatechange = () => {
+        console.log(`Connection state with ${userId}: ${pc.connectionState}`);
+        if (pc.connectionState === 'connected') {
+            console.log(`✅ Successfully connected to ${userId}`);
+        } else if (pc.connectionState === 'failed') {
+            console.log(`❌ Connection failed with ${userId}`);
+            // Don't automatically restart, let user handle it
+        }
+    };
+    
+    // Handle ICE connection state
+    pc.oniceconnectionstatechange = () => {
+        console.log(`ICE connection state with ${userId}: ${pc.iceConnectionState}`);
+    };
+    
+    peerConnections[userId] = pc;
+    
+    // Only create offer if we're the initiator
+    if (isInitiator && currentUser) {
+        setTimeout(() => createOffer(userId), 100); // Small delay to ensure everything is set up
+    }
+    
+    return pc;
+}
+
+// Create and send offer
+async function createOffer(userId) {
+    try {
+        const pc = peerConnections[userId];
+        if (pc) {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            socket.emit('offer', offer, userId);
+        }
+    } catch (error) {
+        console.error('Error creating offer:', error);
+    }
+}
+
+// Update remote user status
+function updateRemoteUserStatus(userId, type, isDisabled) {
+    const participantElement = participants.get(userId);
+    if (participantElement) {
+        const statusContainer = participantElement.querySelector('.video-status');
+        
+        if (type === 'audio' && isDisabled) {
+            // Add mute indicator
+            let muteIcon = statusContainer.querySelector('.audio-muted');
+            if (!muteIcon) {
+                muteIcon = document.createElement('div');
+                muteIcon.className = 'status-icon muted audio-muted';
+                muteIcon.innerHTML = '<span class="material-icons">mic_off</span>';
+                statusContainer.appendChild(muteIcon);
+            }
+        } else if (type === 'audio' && !isDisabled) {
+            // Remove mute indicator
+            const muteIcon = statusContainer.querySelector('.audio-muted');
+            if (muteIcon) {
+                muteIcon.remove();
+            }
+        }
+        
+        if (type === 'video') {
+            const video = participantElement.querySelector('video');
+            if (video) {
+                video.style.opacity = isDisabled ? '0' : '1';
+            }
+        }
     }
 }
 
@@ -84,6 +299,9 @@ async function joinMeeting() {
         
         // Add local participant
         addParticipant(currentUser.id, currentUser.name, true);
+        
+        // Join the room via Socket.IO
+        socket.emit('join-room', roomId, currentUser.id, currentUser.name);
         
         // Update participant count
         updateParticipantCount();
@@ -137,12 +355,14 @@ function addParticipant(participantId, participantName, isLocal = false) {
     if (isLocal && localStream) {
         video.srcObject = localStream;
     } else if (!isLocal) {
-        // For demo purposes, create a colored placeholder for remote participants
+        // Create placeholder for remote participants
         video.style.background = `linear-gradient(45deg, hsl(${Math.random() * 360}, 70%, 50%), hsl(${Math.random() * 360}, 70%, 30%))`;
-        video.style.display = 'none';
+        video.style.display = 'block'; // Show video element immediately
+        video.style.opacity = '0.3'; // Make it slightly transparent until stream arrives
         
-        // Add a demo avatar
+        // Add an avatar that will be hidden when video stream starts
         const avatar = document.createElement('div');
+        avatar.className = 'participant-avatar';
         avatar.style.cssText = `
             position: absolute;
             top: 50%;
@@ -158,6 +378,7 @@ function addParticipant(participantId, participantName, isLocal = false) {
             font-size: 32px;
             font-weight: bold;
             color: white;
+            z-index: 2;
         `;
         avatar.textContent = participantName.charAt(0).toUpperCase();
         participantElement.appendChild(avatar);
@@ -238,6 +459,9 @@ async function toggleMicrophone() {
                 
                 // Update status indicator on local video
                 updateLocalVideoStatus();
+                
+                // Notify other participants
+                socket.emit('toggle-audio', isMuted);
             }
         }
     } catch (error) {
@@ -267,6 +491,9 @@ async function toggleCamera() {
                 if (localVideo) {
                     localVideo.style.opacity = isCameraOff ? '0' : '1';
                 }
+                
+                // Notify other participants
+                socket.emit('toggle-video', isCameraOff);
             }
         }
     } catch (error) {
