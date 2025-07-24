@@ -105,6 +105,17 @@ io.on('connection', (socket) => {
         socket.to(socket.roomId).emit('user-toggle-video', socket.userId, isVideoOff);
     });
     
+    // Handle screen sharing events
+    socket.on('screen-share-started', (userId) => {
+        socket.to(socket.roomId).emit('screen-share-started', userId);
+        console.log(`User ${socket.userName} (${userId}) started screen sharing`);
+    });
+    
+    socket.on('screen-share-stopped', (userId) => {
+        socket.to(socket.roomId).emit('screen-share-stopped', userId);
+        console.log(`User ${socket.userName} (${userId}) stopped screen sharing`);
+    });
+    
     // Handle disconnect
     socket.on('disconnect', () => {
         console.log('User disconnected:', socket.id);

@@ -27,6 +27,7 @@ const sharedScreen = document.getElementById('sharedScreen');
 const socket = io();
 const roomId = 'video-meeting-room';
 let peerConnections = {};
+let iceCandidatesQueue = {}; // Queue for ICE candidates received before remote description
 
 
 // Initialize the app
@@ -102,6 +103,10 @@ function initializeSocketConnection() {
             }
             
             await pc.setRemoteDescription(offer);
+            
+            // Process any queued ICE candidates
+            await processQueuedIceCandidates(fromUserId);
+            
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
             socket.emit('answer', answer, fromUserId);
@@ -116,6 +121,9 @@ function initializeSocketConnection() {
             const pc = peerConnections[fromUserId];
             if (pc && pc.signalingState === 'have-local-offer') {
                 await pc.setRemoteDescription(answer);
+                
+                // Process any queued ICE candidates
+                await processQueuedIceCandidates(fromUserId);
             } else {
                 console.log(`Ignoring answer from ${fromUserId}, wrong state: ${pc ? pc.signalingState : 'no connection'}`);
             }
@@ -130,12 +138,17 @@ function initializeSocketConnection() {
             const pc = peerConnections[fromUserId];
             if (pc && pc.remoteDescription) {
                 await pc.addIceCandidate(candidate);
+                console.log(`✅ Added ICE candidate from ${fromUserId}`);
             } else {
-                console.log(`Queuing ICE candidate from ${fromUserId} (remote description not ready)`);
-                // You could implement queuing here if needed
+                console.log(`⏳ Queuing ICE candidate from ${fromUserId} (remote description not ready)`);
+                // Queue the candidate for later
+                if (!iceCandidatesQueue[fromUserId]) {
+                    iceCandidatesQueue[fromUserId] = [];
+                }
+                iceCandidatesQueue[fromUserId].push(candidate);
             }
         } catch (error) {
-            console.error(`Error handling ICE candidate from ${fromUserId}:`, error);
+            console.error(`❌ Error handling ICE candidate from ${fromUserId}:`, error);
         }
     });
     
@@ -145,6 +158,16 @@ function initializeSocketConnection() {
     
     socket.on('user-toggle-video', (userId, isVideoOff) => {
         updateRemoteUserStatus(userId, 'video', isVideoOff);
+    });
+    
+    socket.on('screen-share-started', (userId) => {
+        console.log(`User ${userId} started screen sharing`);
+        addScreenShareIndicator(userId);
+    });
+    
+    socket.on('screen-share-stopped', (userId) => {
+        console.log(`User ${userId} stopped screen sharing`);
+        removeScreenShareIndicator(userId);
     });
 }
 
@@ -170,23 +193,134 @@ function createPeerConnection(userId, isInitiator = false) {
         });
     }
     
-    // Handle remote stream
+// Handle remote stream
     pc.ontrack = (event) => {
-        console.log(`Received remote ${event.track.kind} track from ${userId}`);
-        const remoteVideo = document.querySelector(`#participant-${userId} video`);
+        console.log(`Received remote ${event.track.kind} track from ${userId}:`, event);
+        const participantElement = document.querySelector(`#participant-${userId}`);
+        const remoteVideo = participantElement?.querySelector('video');
+        
         if (remoteVideo && event.streams[0]) {
-            remoteVideo.srcObject = event.streams[0];
+            console.log(`Setting stream for ${userId}:`, event.streams[0]);
+            
+            // Remove any existing click-to-play buttons
+            const existingPlayButton = participantElement.querySelector('.play-button');
+            if (existingPlayButton) {
+                existingPlayButton.remove();
+            }
+            
+            // Remove loading indicator
+            const loadingIndicator = participantElement.querySelector('.loading-indicator');
+            if (loadingIndicator) {
+                loadingIndicator.remove();
+            }
+            
+            // Handle multiple streams or track additions
+            if (remoteVideo.srcObject) {
+                // Stream already exists, add tracks to existing stream
+                const existingStream = remoteVideo.srcObject;
+                const newTracks = event.streams[0].getTracks();
+                
+                newTracks.forEach(track => {
+                    const existingTrack = existingStream.getTracks().find(t => t.kind === track.kind);
+                    if (existingTrack) {
+                        existingStream.removeTrack(existingTrack);
+                    }
+                    existingStream.addTrack(track);
+                });
+                
+                console.log(`Updated existing stream for ${userId}`);
+            } else {
+                // Set new stream
+                remoteVideo.srcObject = event.streams[0];
+            }
+            
             remoteVideo.style.display = 'block';
             remoteVideo.style.opacity = '1';
+            remoteVideo.style.background = 'transparent';
             
-            // Hide avatar when video starts
-            const participantElement = document.querySelector(`#participant-${userId}`);
-            if (participantElement) {
-                const avatar = participantElement.querySelector('div[style*="position: absolute"]');
-                if (avatar) {
-                    avatar.style.display = 'none';
+            // Essential video properties for proper playback
+            remoteVideo.muted = true; // Prevent audio feedback
+            remoteVideo.autoplay = true;
+            remoteVideo.playsInline = true;
+            remoteVideo.controls = false;
+            
+            // Force video to start playing with comprehensive error handling
+            const tryPlay = async () => {
+                try {
+                    // Ensure video is ready
+                    if (remoteVideo.readyState < 2) {
+                        await new Promise(resolve => {
+                            remoteVideo.addEventListener('loadeddata', resolve, { once: true });
+                        });
+                    }
+                    
+                    await remoteVideo.play();
+                    console.log(`✅ Video playing successfully for ${userId}`);
+                    hideParticipantAvatar(userId);
+                    showConnectionStatus(userId, 'connected');
+                    
+                    // Enable video visibility
+                    remoteVideo.style.opacity = '1';
+                    
+                } catch (error) {
+                    console.log(`Autoplay failed for ${userId}:`, error.message);
+                    
+                    // Try again with user interaction
+                    if (error.name === 'NotAllowedError') {
+                        addClickToPlay(remoteVideo, userId);
+                    } else {
+                        // For other errors, try again after a delay
+                        setTimeout(tryPlay, 1000);
+                    }
                 }
-            }
+            };
+            
+            // Multiple attempts to start video
+            setTimeout(tryPlay, 100);
+            
+            // Try again when metadata loads
+            remoteVideo.addEventListener('loadedmetadata', () => {
+                console.log(`Video metadata loaded for ${userId}`);
+                setTimeout(tryPlay, 50);
+            }, { once: true });
+            
+            // Try again when data loads
+            remoteVideo.addEventListener('loadeddata', () => {
+                console.log(`Video data loaded for ${userId}`);
+                setTimeout(tryPlay, 50);
+            }, { once: true });
+            
+            // Handle track events
+            event.track.addEventListener('ended', () => {
+                console.log(`${event.track.kind} track ended for ${userId}`);
+                if (event.track.kind === 'video') {
+                    showParticipantAvatar(userId);
+                }
+            });
+            
+            // Handle track mute/unmute
+            event.track.addEventListener('mute', () => {
+                console.log(`${event.track.kind} track muted for ${userId}`);
+                if (event.track.kind === 'video') {
+                    remoteVideo.style.opacity = '0.3';
+                }
+            });
+            
+            event.track.addEventListener('unmute', () => {
+                console.log(`${event.track.kind} track unmuted for ${userId}`);
+                if (event.track.kind === 'video') {
+                    remoteVideo.style.opacity = '1';
+                    tryPlay();
+                }
+            });
+            
+            console.log(`✅ Video stream successfully set for ${userId}`);
+        } else {
+            console.warn(`Could not set video stream for ${userId}:`, {
+                remoteVideo: !!remoteVideo,
+                stream: !!event.streams[0],
+                participantElement: !!participantElement
+            });
         }
     };
     
@@ -235,6 +369,29 @@ async function createOffer(userId) {
         }
     } catch (error) {
         console.error('Error creating offer:', error);
+    }
+}
+
+// Process queued ICE candidates
+async function processQueuedIceCandidates(userId) {
+    const pc = peerConnections[userId];
+    const queuedCandidates = iceCandidatesQueue[userId];
+    
+    if (pc && pc.remoteDescription && queuedCandidates && queuedCandidates.length > 0) {
+        console.log(`⏩ Processing ${queuedCandidates.length} queued ICE candidates for ${userId}`);
+        
+        for (const candidate of queuedCandidates) {
+            try {
+                await pc.addIceCandidate(candidate);
+                console.log(`✅ Added queued ICE candidate for ${userId}`);
+            } catch (error) {
+                console.error(`❌ Failed to add queued ICE candidate for ${userId}:`, error);
+            }
+        }
+        
+        // Clear the queue
+        delete iceCandidatesQueue[userId];
+        console.log(`✅ Processed all queued ICE candidates for ${userId}`);
     }
 }
 
@@ -323,8 +480,13 @@ function addParticipant(participantId, participantName, isLocal = false) {
     
     const video = document.createElement('video');
     video.autoplay = true;
-    video.muted = isLocal; // Mute local video to prevent feedback
+    video.muted = true; // All videos should be muted to prevent feedback and allow autoplay
     video.playsInline = true;
+    video.controls = false;
+    
+    // Additional properties for better video handling
+    video.setAttribute('playsinline', 'true');
+    video.setAttribute('webkit-playsinline', 'true');
     
     const nameLabel = document.createElement('div');
     nameLabel.className = 'participant-name';
@@ -382,6 +544,9 @@ function addParticipant(participantId, participantName, isLocal = false) {
         `;
         avatar.textContent = participantName.charAt(0).toUpperCase();
         participantElement.appendChild(avatar);
+        
+        // Add loading indicator for remote participants
+        addLoadingIndicator(participantId);
     }
     
     updateVideoGrid();
@@ -401,19 +566,42 @@ function removeParticipant(participantId) {
 function updateVideoGrid() {
     const participantCount = participants.size;
     
+    // Reset all classes
     videoGrid.className = 'video-grid';
     
-    if (participantCount === 1) {
-        videoGrid.classList.add('single-video');
-    } else if (participantCount === 2) {
-        videoGrid.classList.add('two-videos');
-    } else if (participantCount === 3) {
-        videoGrid.classList.add('three-videos');
-    } else if (participantCount === 4) {
-        videoGrid.classList.add('four-videos');
-    } else {
-        videoGrid.classList.add('many-videos');
+    // Apply appropriate layout class based on participant count
+    switch (participantCount) {
+        case 1:
+            videoGrid.classList.add('single-video');
+            break;
+        case 2:
+            videoGrid.classList.add('two-videos');
+            break;
+        case 3:
+            videoGrid.classList.add('three-videos');
+            break;
+        case 4:
+            videoGrid.classList.add('four-videos');
+            break;
+        case 5:
+            videoGrid.classList.add('five-videos');
+            break;
+        case 6:
+            videoGrid.classList.add('six-videos');
+            break;
+        case 7:
+        case 8:
+            videoGrid.classList.add('seven-videos');
+            break;
+        case 9:
+            videoGrid.classList.add('nine-videos');
+            break;
+        default:
+            videoGrid.classList.add('many-videos');
+            break;
     }
+    
+    console.log(`Updated video grid for ${participantCount} participants`);
 }
 
 // Toggle fullscreen for video
@@ -517,50 +705,299 @@ function updateLocalVideoStatus() {
     }
 }
 
+// Add screen sharing indicator
+function addScreenShareIndicator(userId) {
+    const participantElement = participants.get(userId);
+    if (participantElement) {
+        const nameLabel = participantElement.querySelector('.participant-name');
+        const statusContainer = participantElement.querySelector('.video-status');
+        
+        // Update name label to show screen sharing
+        const originalName = nameLabel.textContent.replace(' (Sharing screen)', '');
+        nameLabel.textContent = originalName + ' (Sharing screen)';
+        
+        // Add screen share icon
+        let screenIcon = statusContainer.querySelector('.screen-sharing');
+        if (!screenIcon) {
+            screenIcon = document.createElement('div');
+            screenIcon.className = 'status-icon screen-sharing';
+            screenIcon.innerHTML = '<span class="material-icons">screen_share</span>';
+            screenIcon.style.background = '#1a73e8';
+            statusContainer.appendChild(screenIcon);
+        }
+        
+        console.log(`Added screen sharing indicator for ${userId}`);
+    }
+}
+
+// Remove screen sharing indicator
+function removeScreenShareIndicator(userId) {
+    const participantElement = participants.get(userId);
+    if (participantElement) {
+        const nameLabel = participantElement.querySelector('.participant-name');
+        const statusContainer = participantElement.querySelector('.video-status');
+        
+        // Remove screen sharing text from name
+        nameLabel.textContent = nameLabel.textContent.replace(' (Sharing screen)', '');
+        
+        // Remove screen share icon
+        const screenIcon = statusContainer.querySelector('.screen-sharing');
+        if (screenIcon) {
+            screenIcon.remove();
+        }
+        
+        console.log(`Removed screen sharing indicator for ${userId}`);
+    }
+}
+
 // Toggle screen sharing
 async function toggleScreenShare() {
     try {
         if (isScreenSharing) {
-            // Stop screen sharing
-            screenShareButton.classList.remove('active');
-            screenShareButton.querySelector('.material-icons').textContent = 'screen_share';
-            sharedContent.style.display = 'none';
-            isScreenSharing = false;
-            console.log('Screen sharing stopped');
+            // Stop screen sharing and return to camera
+            await stopScreenShare();
         } else {
             // Start screen sharing
-            const screenStream = await navigator.mediaDevices.getDisplayMedia({
-                video: true,
-                audio: true
-            });
-            
-            screenShareButton.classList.add('active');
-            screenShareButton.querySelector('.material-icons').textContent = 'stop_screen_share';
-            
-            // Show shared screen overlay
-            sharedContent.style.display = 'flex';
-            
-            // Set up screen share video element
-            const screenVideo = document.createElement('video');
-            screenVideo.autoplay = true;
-            screenVideo.playsInline = true;
-            screenVideo.srcObject = screenStream;
-            sharedScreen.innerHTML = '';
-            sharedScreen.appendChild(screenVideo);
-            
-            isScreenSharing = true;
-            console.log('Screen sharing started');
-            
-            // Listen for screen share end
-            screenStream.getVideoTracks()[0].addEventListener('ended', () => {
-                toggleScreenShare();
-            });
+            await startScreenShare();
         }
     } catch (error) {
         console.error('Failed to toggle screen share:', error);
         if (error.name === 'NotAllowedError') {
             alert('Screen sharing permission denied. Please allow screen sharing and try again.');
         }
+    }
+}
+
+// Start screen sharing
+async function startScreenShare() {
+    try {
+        // Get screen capture stream
+        const screenStream = await navigator.mediaDevices.getDisplayMedia({
+            video: {
+                mediaSource: 'screen',
+                width: { ideal: 1920, max: 1920 },
+                height: { ideal: 1080, max: 1080 },
+                frameRate: { ideal: 30, max: 60 }
+            },
+            audio: {
+                echoCancellation: false,
+                noiseSuppression: false,
+                sampleRate: 44100
+            }
+        });
+        
+        console.log('Screen capture stream obtained:', screenStream);
+        
+        // Update UI
+        screenShareButton.classList.add('active');
+        screenShareButton.querySelector('.material-icons').textContent = 'stop_screen_share';
+        isScreenSharing = true;
+        
+        // Get tracks from screen stream
+        const videoTrack = screenStream.getVideoTracks()[0];
+        const audioTrack = screenStream.getAudioTracks()[0];
+        
+        console.log('Screen sharing tracks:', {
+            video: !!videoTrack,
+            audio: !!audioTrack,
+            videoSettings: videoTrack?.getSettings(),
+            audioSettings: audioTrack?.getSettings()
+        });
+        
+        // Store original camera stream for later restoration
+        window.originalStream = localStream;
+        
+        // Create new stream with screen tracks
+        const combinedStream = new MediaStream();
+        
+        // Add video track from screen
+        if (videoTrack) {
+            combinedStream.addTrack(videoTrack);
+        }
+        
+        // Add audio - prefer screen audio, fallback to microphone
+        if (audioTrack) {
+            combinedStream.addTrack(audioTrack);
+            console.log('Using screen audio');
+        } else if (localStream && localStream.getAudioTracks()[0]) {
+            combinedStream.addTrack(localStream.getAudioTracks()[0]);
+            console.log('Using microphone audio');
+        }
+        
+        // Replace tracks in all peer connections with better error handling
+        const trackReplacementPromises = [];
+        
+        for (const [userId, pc] of Object.entries(peerConnections)) {
+            console.log(`Replacing tracks for user ${userId}`);
+            
+            const senders = pc.getSenders();
+            console.log(`Found ${senders.length} senders for ${userId}`);
+            
+            // Replace video track
+            const videoSender = senders.find(sender => 
+                sender.track && sender.track.kind === 'video'
+            );
+            
+            if (videoSender && videoTrack) {
+                const replaceVideoPromise = videoSender.replaceTrack(videoTrack)
+                    .then(() => {
+                        console.log(`✅ Successfully replaced video track for ${userId}`);
+                    })
+                    .catch(error => {
+                        console.error(`❌ Failed to replace video track for ${userId}:`, error);
+                        // Try to re-add the track
+                        return pc.addTrack(videoTrack, combinedStream)
+                            .then(() => console.log(`✅ Re-added video track for ${userId}`))
+                            .catch(e => console.error(`❌ Failed to re-add video track for ${userId}:`, e));
+                    });
+                trackReplacementPromises.push(replaceVideoPromise);
+            } else {
+                console.warn(`No video sender found for ${userId}`);
+                // Add track if sender doesn't exist
+                if (videoTrack) {
+                    try {
+                        pc.addTrack(videoTrack, combinedStream);
+                        console.log(`✅ Added new video track for ${userId}`);
+                    } catch (error) {
+                        console.error(`❌ Failed to add video track for ${userId}:`, error);
+                    }
+                }
+            }
+            
+            // Replace audio track if we have screen audio
+            if (audioTrack) {
+                const audioSender = senders.find(sender => 
+                    sender.track && sender.track.kind === 'audio'
+                );
+                
+                if (audioSender) {
+                    const replaceAudioPromise = audioSender.replaceTrack(audioTrack)
+                        .then(() => {
+                            console.log(`✅ Successfully replaced audio track for ${userId}`);
+                        })
+                        .catch(error => {
+                            console.error(`❌ Failed to replace audio track for ${userId}:`, error);
+                        });
+                    trackReplacementPromises.push(replaceAudioPromise);
+                }
+            }
+        }
+        
+        // Wait for all track replacements to complete
+        try {
+            await Promise.allSettled(trackReplacementPromises);
+            console.log('✅ All track replacements completed');
+        } catch (error) {
+            console.error('❌ Some track replacements failed:', error);
+        }
+        
+        // Update local video display with screen share
+        const localVideo = document.querySelector(`#participant-${currentUser.id} video`);
+        if (localVideo) {
+            localVideo.srcObject = combinedStream;
+            console.log('✅ Updated local video display with screen share');
+            
+            // Ensure local video plays
+            try {
+                await localVideo.play();
+            } catch (error) {
+                console.warn('Local video autoplay failed:', error);
+            }
+        }
+        
+        // Update local stream reference
+        localStream = combinedStream;
+        
+        // Notify other participants that screen sharing started
+        socket.emit('screen-share-started', currentUser.id);
+        
+        console.log('✅ Screen sharing started and transmitted to all peers');
+        
+        // Listen for screen share end (when user clicks "Stop sharing" in browser)
+        videoTrack.addEventListener('ended', () => {
+            console.log('Screen share ended by user (browser stop sharing)');
+            stopScreenShare();
+        });
+        
+        // Also listen for track becoming inactive
+        videoTrack.addEventListener('mute', () => {
+            console.log('Screen share video track muted');
+        });
+        
+        if (audioTrack) {
+            audioTrack.addEventListener('ended', () => {
+                console.log('Screen share audio ended');
+            });
+        }
+        
+    } catch (error) {
+        console.error('❌ Failed to start screen share:', error);
+        
+        // Reset UI state on failure
+        screenShareButton.classList.remove('active');
+        screenShareButton.querySelector('.material-icons').textContent = 'screen_share';
+        isScreenSharing = false;
+        
+        throw error;
+    }
+}
+
+// Stop screen sharing and return to camera
+async function stopScreenShare() {
+    try {
+        // Update UI
+        screenShareButton.classList.remove('active');
+        screenShareButton.querySelector('.material-icons').textContent = 'screen_share';
+        isScreenSharing = false;
+        
+        // Get camera stream back
+        const cameraStream = window.originalStream || await navigator.mediaDevices.getUserMedia({
+            video: true,
+            audio: true
+        });
+        
+        // Replace screen share tracks back to camera tracks in all peer connections
+        for (const [userId, pc] of Object.entries(peerConnections)) {
+            const senders = pc.getSenders();
+            
+            // Replace video track back to camera
+            const videoSender = senders.find(sender => 
+                sender.track && sender.track.kind === 'video'
+            );
+            if (videoSender) {
+                const cameraVideoTrack = cameraStream.getVideoTracks()[0];
+                await videoSender.replaceTrack(cameraVideoTrack);
+                console.log(`Restored camera video track for ${userId}`);
+            }
+            
+            // Replace audio track back to microphone
+            const audioSender = senders.find(sender => 
+                sender.track && sender.track.kind === 'audio'
+            );
+            if (audioSender) {
+                const cameraAudioTrack = cameraStream.getAudioTracks()[0];
+                await audioSender.replaceTrack(cameraAudioTrack);
+                console.log(`Restored microphone audio track for ${userId}`);
+            }
+        }
+        
+        // Update local video display back to camera
+        const localVideo = document.querySelector(`#participant-${currentUser.id} video`);
+        if (localVideo) {
+            localVideo.srcObject = cameraStream;
+        }
+        
+        // Update local stream reference
+        localStream = cameraStream;
+        
+        // Notify other participants that screen sharing stopped
+        socket.emit('screen-share-stopped', currentUser.id);
+        
+        console.log('Screen sharing stopped, returned to camera');
+        
+    } catch (error) {
+        console.error('Failed to stop screen share:', error);
+        throw error;
     }
 }
 
@@ -638,6 +1075,129 @@ nameInput.addEventListener('keypress', (e) => {
         joinMeeting();
     }
 });
+
+// Helper functions for better video connection handling
+
+// Show connection status for a participant
+function showConnectionStatus(userId, status) {
+    const participantElement = document.querySelector(`#participant-${userId}`);
+    if (participantElement) {
+        // Remove existing status indicators
+        const existingStatus = participantElement.querySelector('.connection-status');
+        if (existingStatus) {
+            existingStatus.remove();
+        }
+        
+        if (status === 'connected') {
+            // Add a brief success indicator
+            const statusIndicator = document.createElement('div');
+            statusIndicator.className = 'connection-status connected';
+            statusIndicator.innerHTML = '✅';
+            statusIndicator.style.cssText = `
+                position: absolute;
+                top: 8px;
+                left: 8px;
+                background: rgba(34, 139, 34, 0.9);
+                color: white;
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-size: 12px;
+                z-index: 3;
+                animation: fadeInOut 3s ease forwards;
+            `;
+            participantElement.appendChild(statusIndicator);
+            
+            // Auto-remove after 3 seconds
+            setTimeout(() => {
+                if (statusIndicator.parentNode) {
+                    statusIndicator.remove();
+                }
+            }, 3000);
+        }
+    }
+}
+
+// Hide participant avatar when video is working
+function hideParticipantAvatar(userId) {
+    const participantElement = document.querySelector(`#participant-${userId}`);
+    if (participantElement) {
+        const avatar = participantElement.querySelector('.participant-avatar');
+        if (avatar) {
+            avatar.style.display = 'none';
+        }
+    }
+}
+
+// Show participant avatar when video is not working
+function showParticipantAvatar(userId) {
+    const participantElement = document.querySelector(`#participant-${userId}`);
+    if (participantElement) {
+        const avatar = participantElement.querySelector('.participant-avatar');
+        if (avatar) {
+            avatar.style.display = 'flex';
+        }
+    }
+}
+
+// Add click to play functionality for videos that can't autoplay
+function addClickToPlay(videoElement, userId) {
+    const playButton = document.createElement('div');
+    playButton.className = 'play-button';
+    playButton.innerHTML = '▶️ Click to play video';
+    playButton.style.cssText = `
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        background: rgba(0, 0, 0, 0.8);
+        color: white;
+        padding: 12px 16px;
+        border-radius: 8px;
+        cursor: pointer;
+        z-index: 4;
+        font-size: 14px;
+        font-weight: 500;
+        text-align: center;
+    `;
+    
+    const participantElement = document.querySelector(`#participant-${userId}`);
+    if (participantElement) {
+        participantElement.appendChild(playButton);
+        
+        playButton.addEventListener('click', async () => {
+            try {
+                await videoElement.play();
+                playButton.remove();
+                hideParticipantAvatar(userId);
+                console.log(`Video manually started for ${userId}`);
+            } catch (error) {
+                console.error('Failed to play video manually:', error);
+            }
+        });
+    }
+}
+
+// Add loading indicator for connecting participants
+function addLoadingIndicator(userId) {
+    const participantElement = document.querySelector(`#participant-${userId}`);
+    if (participantElement) {
+        const loadingIndicator = document.createElement('div');
+        loadingIndicator.className = 'loading-indicator';
+        loadingIndicator.innerHTML = '⏳ Connecting...';
+        loadingIndicator.style.cssText = `
+            position: absolute;
+            top: 12px;
+            left: 12px;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            z-index: 3;
+        `;
+        participantElement.appendChild(loadingIndicator);
+    }
+}
 
 // Initialize the app when page loads
 document.addEventListener('DOMContentLoaded', initializeApp);
