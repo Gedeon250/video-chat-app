@@ -6,6 +6,24 @@ let isCameraOff = false;
 let meetingStartTime;
 let participants = new Map();
 let currentUser;
+let deviceType = detectDeviceType();
+let isGoogleStreamingMode = false;
+
+// Device detection for better compatibility
+function detectDeviceType() {
+    const userAgent = navigator.userAgent;
+    const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(userAgent);
+    const isTablet = /(iPad|Android(?!.*Mobile))/i.test(userAgent);
+    
+    return {
+        isMobile,
+        isTablet,
+        isDesktop: !isMobile && !isTablet,
+        isIOS: /iPad|iPhone|iPod/.test(userAgent),
+        isAndroid: /Android/i.test(userAgent),
+        supportsGetDisplayMedia: navigator.mediaDevices && 'getDisplayMedia' in navigator.mediaDevices
+    };
+}
 
 // DOM elements
 const preJoinScreen = document.getElementById('preJoinScreen');
@@ -45,13 +63,12 @@ async function initializeApp() {
 // Start camera preview before joining
 async function startPreview() {
     try {
-        const stream = await navigator.mediaDevices.getUserMedia({ 
-            video: true, 
-            audio: true 
-        });
+        const constraints = getOptimalMediaConstraints();
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
         previewVideo.srcObject = stream;
         localStream = stream;
-        console.log('Camera preview started');
+        console.log('Camera preview started with constraints:', constraints);
+        console.log('Stream tracks:', stream.getTracks().map(t => ({ kind: t.kind, settings: t.getSettings() })));
     } catch (error) {
         console.error('Failed to access camera:', error);
         // Show placeholder if camera access fails
@@ -61,6 +78,55 @@ async function startPreview() {
         placeholder.textContent = 'Camera not available';
         previewVideo.parentNode.appendChild(placeholder);
     }
+}
+
+// Get optimal media constraints based on device type and capabilities
+function getOptimalMediaConstraints() {
+    const baseConstraints = {
+        video: {
+            width: { ideal: 640, max: 1280 },
+            height: { ideal: 480, max: 720 },
+            frameRate: { ideal: 30, max: 30 },
+            facingMode: 'user'
+        },
+        audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            sampleRate: 48000,
+            channelCount: 1
+        }
+    };
+
+    // Optimize for mobile devices
+    if (deviceType.isMobile) {
+        baseConstraints.video.width = { ideal: 480, max: 640 };
+        baseConstraints.video.height = { ideal: 360, max: 480 };
+        baseConstraints.video.frameRate = { ideal: 24, max: 30 };
+        
+        // Mobile-specific audio optimizations
+        baseConstraints.audio.sampleRate = 44100;
+        baseConstraints.audio.latency = 0.01; // Low latency for better sync
+    }
+
+    // Optimize for tablets
+    if (deviceType.isTablet) {
+        baseConstraints.video.width = { ideal: 640, max: 960 };
+        baseConstraints.video.height = { ideal: 480, max: 540 };
+    }
+
+    // Desktop optimizations for Google streaming
+    if (deviceType.isDesktop) {
+        baseConstraints.video.width = { ideal: 960, max: 1280 };
+        baseConstraints.video.height = { ideal: 540, max: 720 };
+        baseConstraints.video.frameRate = { ideal: 30, max: 60 };
+        
+        // Higher quality audio for desktop
+        baseConstraints.audio.sampleRate = 48000;
+        baseConstraints.audio.channelCount = 2;
+    }
+
+    return baseConstraints;
 }
 
 // Initialize Socket.IO connection
@@ -138,9 +204,9 @@ function initializeSocketConnection() {
             const pc = peerConnections[fromUserId];
             if (pc && pc.remoteDescription) {
                 await pc.addIceCandidate(candidate);
-                console.log(`✅ Added ICE candidate from ${fromUserId}`);
+                console.log(` Added ICE candidate from ${fromUserId}`);
             } else {
-                console.log(`⏳ Queuing ICE candidate from ${fromUserId} (remote description not ready)`);
+                console.log(` Queuing ICE candidate from ${fromUserId} (remote description not ready)`);
                 // Queue the candidate for later
                 if (!iceCandidatesQueue[fromUserId]) {
                     iceCandidatesQueue[fromUserId] = [];
@@ -148,7 +214,7 @@ function initializeSocketConnection() {
                 iceCandidatesQueue[fromUserId].push(candidate);
             }
         } catch (error) {
-            console.error(`❌ Error handling ICE candidate from ${fromUserId}:`, error);
+            console.error(`Error handling ICE candidate from ${fromUserId}:`, error);
         }
     });
     
@@ -255,7 +321,7 @@ function createPeerConnection(userId, isInitiator = false) {
                     }
                     
                     await remoteVideo.play();
-                    console.log(`✅ Video playing successfully for ${userId}`);
+                    console.log(` Video playing successfully for ${userId}`);
                     hideParticipantAvatar(userId);
                     showConnectionStatus(userId, 'connected');
                     
@@ -314,7 +380,7 @@ function createPeerConnection(userId, isInitiator = false) {
                 }
             });
             
-            console.log(`✅ Video stream successfully set for ${userId}`);
+            console.log(` Video stream successfully set for ${userId}`);
         } else {
             console.warn(`Could not set video stream for ${userId}:`, {
                 remoteVideo: !!remoteVideo,
@@ -336,9 +402,9 @@ function createPeerConnection(userId, isInitiator = false) {
     pc.onconnectionstatechange = () => {
         console.log(`Connection state with ${userId}: ${pc.connectionState}`);
         if (pc.connectionState === 'connected') {
-            console.log(`✅ Successfully connected to ${userId}`);
+            console.log(` Successfully connected to ${userId}`);
         } else if (pc.connectionState === 'failed') {
-            console.log(`❌ Connection failed with ${userId}`);
+            console.log(`Connection failed with ${userId}`);
             // Don't automatically restart, let user handle it
         }
     };
@@ -378,20 +444,20 @@ async function processQueuedIceCandidates(userId) {
     const queuedCandidates = iceCandidatesQueue[userId];
     
     if (pc && pc.remoteDescription && queuedCandidates && queuedCandidates.length > 0) {
-        console.log(`⏩ Processing ${queuedCandidates.length} queued ICE candidates for ${userId}`);
+        console.log(` Processing ${queuedCandidates.length} queued ICE candidates for ${userId}`);
         
         for (const candidate of queuedCandidates) {
             try {
                 await pc.addIceCandidate(candidate);
-                console.log(`✅ Added queued ICE candidate for ${userId}`);
+                console.log(` Added queued ICE candidate for ${userId}`);
             } catch (error) {
-                console.error(`❌ Failed to add queued ICE candidate for ${userId}:`, error);
+                console.error(` Failed to add queued ICE candidate for ${userId}:`, error);
             }
         }
         
         // Clear the queue
         delete iceCandidatesQueue[userId];
-        console.log(`✅ Processed all queued ICE candidates for ${userId}`);
+        console.log(` Processed all queued ICE candidates for ${userId}`);
     }
 }
 
@@ -841,14 +907,14 @@ async function startScreenShare() {
             if (videoSender && videoTrack) {
                 const replaceVideoPromise = videoSender.replaceTrack(videoTrack)
                     .then(() => {
-                        console.log(`✅ Successfully replaced video track for ${userId}`);
+                        console.log(` Successfully replaced video track for ${userId}`);
                     })
                     .catch(error => {
-                        console.error(`❌ Failed to replace video track for ${userId}:`, error);
+                        console.error(` Failed to replace video track for ${userId}:`, error);
                         // Try to re-add the track
                         return pc.addTrack(videoTrack, combinedStream)
-                            .then(() => console.log(`✅ Re-added video track for ${userId}`))
-                            .catch(e => console.error(`❌ Failed to re-add video track for ${userId}:`, e));
+                            .then(() => console.log(` Re-added video track for ${userId}`))
+                            .catch(e => console.error(` Failed to re-add video track for ${userId}:`, e));
                     });
                 trackReplacementPromises.push(replaceVideoPromise);
             } else {
@@ -857,9 +923,9 @@ async function startScreenShare() {
                 if (videoTrack) {
                     try {
                         pc.addTrack(videoTrack, combinedStream);
-                        console.log(`✅ Added new video track for ${userId}`);
+                        console.log(` Added new video track for ${userId}`);
                     } catch (error) {
-                        console.error(`❌ Failed to add video track for ${userId}:`, error);
+                        console.error(` Failed to add video track for ${userId}:`, error);
                     }
                 }
             }
@@ -873,10 +939,10 @@ async function startScreenShare() {
                 if (audioSender) {
                     const replaceAudioPromise = audioSender.replaceTrack(audioTrack)
                         .then(() => {
-                            console.log(`✅ Successfully replaced audio track for ${userId}`);
+                            console.log(` Successfully replaced audio track for ${userId}`);
                         })
                         .catch(error => {
-                            console.error(`❌ Failed to replace audio track for ${userId}:`, error);
+                            console.error(` Failed to replace audio track for ${userId}:`, error);
                         });
                     trackReplacementPromises.push(replaceAudioPromise);
                 }
@@ -886,16 +952,16 @@ async function startScreenShare() {
         // Wait for all track replacements to complete
         try {
             await Promise.allSettled(trackReplacementPromises);
-            console.log('✅ All track replacements completed');
+            console.log(' All track replacements completed');
         } catch (error) {
-            console.error('❌ Some track replacements failed:', error);
+            console.error(' Some track replacements failed:', error);
         }
         
         // Update local video display with screen share
         const localVideo = document.querySelector(`#participant-${currentUser.id} video`);
         if (localVideo) {
             localVideo.srcObject = combinedStream;
-            console.log('✅ Updated local video display with screen share');
+            console.log(' Updated local video display with screen share');
             
             // Ensure local video plays
             try {
@@ -911,7 +977,7 @@ async function startScreenShare() {
         // Notify other participants that screen sharing started
         socket.emit('screen-share-started', currentUser.id);
         
-        console.log('✅ Screen sharing started and transmitted to all peers');
+        console.log(' Screen sharing started and transmitted to all peers');
         
         // Listen for screen share end (when user clicks "Stop sharing" in browser)
         videoTrack.addEventListener('ended', () => {
@@ -931,7 +997,7 @@ async function startScreenShare() {
         }
         
     } catch (error) {
-        console.error('❌ Failed to start screen share:', error);
+        console.error(' Failed to start screen share:', error);
         
         // Reset UI state on failure
         screenShareButton.classList.remove('active');
@@ -1199,5 +1265,345 @@ function addLoadingIndicator(userId) {
     }
 }
 
+// Enhanced Google streaming compatibility functions
+
+// Create composite stream for Google Meet/streaming integration
+function createCompositeStream() {
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    
+    // Set canvas dimensions based on device type
+    if (deviceType.isMobile) {
+        canvas.width = 640;
+        canvas.height = 480;
+    } else if (deviceType.isTablet) {
+        canvas.width = 960;
+        canvas.height = 540;
+    } else {
+        canvas.width = 1280;
+        canvas.height = 720;
+    }
+    
+    console.log(`Created composite canvas: ${canvas.width}x${canvas.height}`);
+    
+    // Function to draw all participants on canvas
+    function drawComposite() {
+        ctx.fillStyle = '#202124';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        
+        const participantVideos = Array.from(participants.entries()).map(([id, element]) => {
+            const video = element.querySelector('video');
+            return { id, video, element };
+        }).filter(p => p.video && p.video.videoWidth > 0);
+        
+        if (participantVideos.length === 0) {
+            // Show waiting message
+            ctx.fillStyle = '#ffffff';
+            ctx.font = '24px Arial';
+            ctx.textAlign = 'center';
+            ctx.fillText('Waiting for participants...', canvas.width / 2, canvas.height / 2);
+            return;
+        }
+        
+        // Calculate grid layout
+        const cols = Math.ceil(Math.sqrt(participantVideos.length));
+        const rows = Math.ceil(participantVideos.length / cols);
+        const cellWidth = canvas.width / cols;
+        const cellHeight = canvas.height / rows;
+        
+        participantVideos.forEach((participant, index) => {
+            const { video, element } = participant;
+            const col = index % cols;
+            const row = Math.floor(index / cols);
+            const x = col * cellWidth;
+            const y = row * cellHeight;
+            
+            try {
+                // Draw video with proper aspect ratio
+                const aspectRatio = video.videoWidth / video.videoHeight;
+                let drawWidth = cellWidth;
+                let drawHeight = cellHeight;
+                let drawX = x;
+                let drawY = y;
+                
+                if (aspectRatio > cellWidth / cellHeight) {
+                    drawHeight = cellWidth / aspectRatio;
+                    drawY = y + (cellHeight - drawHeight) / 2;
+                } else {
+                    drawWidth = cellHeight * aspectRatio;
+                    drawX = x + (cellWidth - drawWidth) / 2;
+                }
+                
+                ctx.drawImage(video, drawX, drawY, drawWidth, drawHeight);
+                
+                // Draw participant name
+                const nameLabel = element.querySelector('.participant-name');
+                if (nameLabel) {
+                    ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+                    ctx.fillRect(x + 10, y + cellHeight - 30, nameLabel.textContent.length * 8 + 20, 20);
+                    ctx.fillStyle = '#ffffff';
+                    ctx.font = '14px Arial';
+                    ctx.textAlign = 'left';
+                    ctx.fillText(nameLabel.textContent, x + 20, y + cellHeight - 15);
+                }
+                
+                // Draw mute indicator if muted
+                const muteIcon = element.querySelector('.audio-muted');
+                if (muteIcon) {
+                    ctx.fillStyle = '#ea4335';
+                    ctx.beginPath();
+                    ctx.arc(x + cellWidth - 20, y + 20, 8, 0, 2 * Math.PI);
+                    ctx.fill();
+                    ctx.fillStyle = '#ffffff';
+                    ctx.font = '12px Arial';
+                    ctx.textAlign = 'center';
+                    ctx.fillText('🔇', x + cellWidth - 20, y + 25);
+                }
+                
+            } catch (error) {
+                console.warn(`Failed to draw participant ${participant.id}:`, error);
+                // Draw placeholder
+                ctx.fillStyle = '#3c4043';
+                ctx.fillRect(x, y, cellWidth, cellHeight);
+                ctx.fillStyle = '#ffffff';
+                ctx.font = '16px Arial';
+                ctx.textAlign = 'center';
+                ctx.fillText('Video Loading...', x + cellWidth / 2, y + cellHeight / 2);
+            }
+        });
+    }
+    
+    // Start animation loop for composite stream
+    let animationId;
+    function animate() {
+        drawComposite();
+        animationId = requestAnimationFrame(animate);
+    }
+    animate();
+    
+    // Create stream from canvas
+    const compositeStream = canvas.captureStream(30); // 30 FPS
+    
+    // Add audio from all participants (mixed)
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    const destination = audioContext.createMediaStreamDestination();
+    
+    // Mix audio from all participants
+    participants.forEach((element, id) => {
+        const video = element.querySelector('video');
+        if (video && video.srcObject) {
+            const audioTracks = video.srcObject.getAudioTracks();
+            if (audioTracks.length > 0) {
+                const source = audioContext.createMediaStreamSource(video.srcObject);
+                source.connect(destination);
+            }
+        }
+    });
+    
+    // Add mixed audio to composite stream
+    destination.stream.getAudioTracks().forEach(track => {
+        compositeStream.addTrack(track);
+    });
+    
+    return {
+        stream: compositeStream,
+        canvas,
+        stop: () => {
+            if (animationId) {
+                cancelAnimationFrame(animationId);
+            }
+            compositeStream.getTracks().forEach(track => track.stop());
+            audioContext.close();
+        }
+    };
+}
+
+// Enable Google streaming mode
+function enableGoogleStreamingMode() {
+    isGoogleStreamingMode = true;
+    
+    // Add a composite stream button
+    const compositeButton = document.createElement('button');
+    compositeButton.id = 'compositeButton';
+    compositeButton.className = 'control-btn';
+    compositeButton.title = 'Create composite stream for Google Meet';
+    compositeButton.innerHTML = '<span class="material-icons">view_comfy</span>';
+    
+    const controlButtons = document.querySelector('.control-buttons');
+    controlButtons.insertBefore(compositeButton, document.getElementById('leaveButton'));
+    
+    let compositeStreamData = null;
+    
+    compositeButton.addEventListener('click', async () => {
+        try {
+            if (compositeStreamData) {
+                // Stop composite stream
+                compositeStreamData.stop();
+                compositeStreamData = null;
+                compositeButton.classList.remove('active');
+                compositeButton.title = 'Create composite stream for Google Meet';
+                console.log('Composite stream stopped');
+            } else {
+                // Start composite stream
+                compositeStreamData = createCompositeStream();
+                compositeButton.classList.add('active');
+                compositeButton.title = 'Stop composite stream';
+                
+                // Show instructions to user
+                showCompositeStreamInstructions(compositeStreamData.canvas);
+                console.log('Composite stream created and ready for Google Meet');
+            }
+        } catch (error) {
+            console.error('Failed to toggle composite stream:', error);
+            alert('Failed to create composite stream. Please try again.');
+        }
+    });
+    
+    console.log('Google streaming mode enabled');
+}
+
+// Show instructions for using composite stream with Google Meet
+function showCompositeStreamInstructions(canvas) {
+    const modal = document.createElement('div');
+    modal.className = 'composite-instructions-modal';
+    modal.innerHTML = `
+        <div class="modal-content">
+            <h3>Composite Stream Ready! </h3>
+            <p>Your video chat is now optimized for Google Meet sharing:</p>
+            <ol>
+                <li>Open Google Meet in a new tab</li>
+                <li>Click "Share screen" in Google Meet</li>
+                <li>Select "Chrome Tab" and choose this tab</li>
+                <li>All participants will be visible in a single view</li>
+            </ol>
+            <div class="canvas-preview">
+                <p><strong>Preview:</strong></p>
+                <div id="canvasPreview"></div>
+            </div>
+            <button id="closeInstructions" class="join-btn">Got it!</button>
+        </div>
+    `;
+    
+    modal.style.cssText = `
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: rgba(0, 0, 0, 0.8);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 10000;
+    `;
+    
+    const modalContent = modal.querySelector('.modal-content');
+    modalContent.style.cssText = `
+        background: white;
+        padding: 30px;
+        border-radius: 12px;
+        max-width: 500px;
+        width: 90%;
+        text-align: center;
+        color: #202124;
+    `;
+    
+    const canvasPreview = modal.querySelector('#canvasPreview');
+    const previewCanvas = canvas.cloneNode();
+    previewCanvas.style.cssText = `
+        width: 100%;
+        max-width: 400px;
+        height: auto;
+        border: 2px solid #1a73e8;
+        border-radius: 8px;
+        margin: 10px 0;
+    `;
+    canvasPreview.appendChild(previewCanvas);
+    
+    document.body.appendChild(modal);
+    
+    modal.querySelector('#closeInstructions').addEventListener('click', () => {
+        modal.remove();
+    });
+    
+    // Close on outside click
+    modal.addEventListener('click', (e) => {
+        if (e.target === modal) {
+            modal.remove();
+        }
+    });
+}
+
+// Optimize video elements for better streaming performance
+function optimizeForStreaming() {
+    // Enable hardware acceleration where possible
+    const videos = document.querySelectorAll('video');
+    videos.forEach(video => {
+        video.style.willChange = 'transform';
+        video.style.backfaceVisibility = 'hidden';
+        video.style.perspective = '1000px';
+        
+        // Ensure consistent playback
+        video.addEventListener('loadedmetadata', () => {
+            if (video.readyState >= 2) {
+                video.play().catch(e => console.log('Video play failed:', e));
+            }
+        });
+    });
+    
+    // Optimize video grid for streaming
+    videoGrid.style.willChange = 'transform';
+    videoGrid.style.backfaceVisibility = 'hidden';
+}
+
+// Enhanced video quality monitoring
+function monitorVideoQuality() {
+    setInterval(() => {
+        participants.forEach((element, userId) => {
+            const video = element.querySelector('video');
+            if (video && video.srcObject) {
+                const stream = video.srcObject;
+                const videoTracks = stream.getVideoTracks();
+                if (videoTracks.length > 0) {
+                    const track = videoTracks[0];
+                    const settings = track.getSettings();
+                    
+                    // Log quality metrics for debugging
+                    if (settings.width && settings.height) {
+                        console.log(` ${userId} video quality: ${settings.width}x${settings.height} @ ${settings.frameRate || 'unknown'}fps`);
+                    }
+                    
+                    // Check if video is playing
+                    if (video.readyState >= 2 && !video.paused) {
+                        // Video is playing well
+                        video.style.filter = 'none';
+                    } else {
+                        // Video might have issues
+                        video.style.filter = 'grayscale(0.3)';
+                    }
+                }
+            }
+        });
+    }, 5000); // Check every 5 seconds
+}
+
 // Initialize the app when page loads
-document.addEventListener('DOMContentLoaded', initializeApp);
+document.addEventListener('DOMContentLoaded', () => {
+    initializeApp();
+    
+    // Enable Google streaming optimizations
+    setTimeout(() => {
+        enableGoogleStreamingMode();
+        optimizeForStreaming();
+        monitorVideoQuality();
+    }, 1000);
+    
+    // Log device information for debugging
+    console.log('🔍 Device Information:', {
+        type: deviceType,
+        userAgent: navigator.userAgent,
+        screenResolution: `${screen.width}x${screen.height}`,
+        viewportSize: `${window.innerWidth}x${window.innerHeight}`,
+        connection: navigator.connection?.effectiveType || 'unknown'
+    });
+});
